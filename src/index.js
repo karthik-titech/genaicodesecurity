@@ -91,13 +91,13 @@ class GoogleHomeSecurityPatch {
       });
     });
 
-    // Security patch endpoints
+    // API routes (v1)
+    const apiRouter = new (require('./routes/api'))();
+    this.app.use('/api', apiRouter.getRouter());
+    
+    // Legacy routes (for backward compatibility)
     this.app.use('/api/security', require('./routes/security'));
-    
-    // Google Home integration endpoints
     this.app.use('/api/google-home', require('./routes/googleHome'));
-    
-    // Calendar integration endpoints
     this.app.use('/api/calendar', require('./routes/calendar'));
     
     // Error handling middleware

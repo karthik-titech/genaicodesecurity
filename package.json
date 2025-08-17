@@ -9,6 +9,7 @@
     "build": "echo 'Build completed' && npm run lint && npm test",
     "test": "jest",
     "test-security": "node test-security-patch.js",
+    "test-api": "node test-api.js",
     "lint": "eslint src/",
     "security-scan": "npm audit && snyk test",
     "security-audit": "npm audit --audit-level=moderate",
