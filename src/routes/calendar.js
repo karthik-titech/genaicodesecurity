@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, validationResult, param, query } = require('express-validator');
 const Logger = require('../utils/Logger');
 
 class CalendarRoutes {
@@ -10,57 +10,131 @@ class CalendarRoutes {
   }
 
   setupRoutes() {
-    // Process calendar event
+    // Process calendar event with enhanced validation
     router.post('/process-event', [
       body('event').isObject(),
-      body('userId').isString().notEmpty(),
-      body('sessionId').optional().isString()
+      body('event.id').optional().isString().isLength({ min: 1, max: 100 }),
+      body('event.title').optional().isString().isLength({ min: 1, max: 500 }).escape(),
+      body('event.description').optional().isString().isLength({ max: 2000 }).escape(),
+      body('event.start').optional().isISO8601(),
+      body('event.end').optional().isISO8601(),
+      body('event.attendees').optional().isArray(),
+      body('event.attendees.*.email').optional().isEmail(),
+      body('event.attendees.*.name').optional().isString().isLength({ min: 1, max: 100 }).escape(),
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('sessionId').optional().isString().isLength({ min: 1, max: 100 })
     ], this.processCalendarEvent.bind(this));
     
-    // Validate calendar event
+    // Validate calendar event with enhanced validation
     router.post('/validate-event', [
       body('event').isObject(),
-      body('userId').isString().notEmpty()
+      body('event.id').optional().isString().isLength({ min: 1, max: 100 }),
+      body('event.title').optional().isString().isLength({ min: 1, max: 500 }).escape(),
+      body('event.description').optional().isString().isLength({ max: 2000 }).escape(),
+      body('event.start').optional().isISO8601(),
+      body('event.end').optional().isISO8601(),
+      body('userId').isString().isLength({ min: 1, max: 100 })
     ], this.validateCalendarEvent.bind(this));
     
     // Get calendar security status
     router.get('/security-status', this.getCalendarSecurityStatus.bind(this));
     
-    // Get calendar threat statistics
-    router.get('/threats', this.getCalendarThreatStats.bind(this));
+    // Get calendar threat statistics with validation
+    router.get('/threats', [
+      query('timeRange').optional().isIn(['1h', '24h', '7d', '30d']),
+      query('limit').optional().isInt({ min: 1, max: 1000 }),
+      query('offset').optional().isInt({ min: 0 })
+    ], this.getCalendarThreatStats.bind(this));
     
-    // Test calendar security
+    // Test calendar security with enhanced validation
     router.post('/test', [
       body('events').isArray(),
-      body('userId').isString().notEmpty()
+      body('events.*.id').optional().isString().isLength({ min: 1, max: 100 }),
+      body('events.*.title').optional().isString().isLength({ min: 1, max: 500 }).escape(),
+      body('events.*.description').optional().isString().isLength({ max: 2000 }).escape(),
+      body('userId').isString().isLength({ min: 1, max: 100 })
     ], this.testCalendarSecurity.bind(this));
     
-    // Get calendar logs
-    router.get('/logs', this.getCalendarLogs.bind(this));
+    // Get calendar logs with validation
+    router.get('/logs', [
+      query('lines').optional().isInt({ min: 1, max: 1000 }),
+      query('type').optional().isIn(['all', 'security', 'access', 'error']),
+      query('startDate').optional().isISO8601(),
+      query('endDate').optional().isISO8601()
+    ], this.getCalendarLogs.bind(this));
     
-    // Update calendar security settings
+    // Update calendar security settings with enhanced validation
     router.put('/security-settings', [
       body('settings').isObject(),
-      body('userId').isString().notEmpty()
+      body('settings.eventValidation').optional().isBoolean(),
+      body('settings.attendeeValidation').optional().isBoolean(),
+      body('settings.contentFiltering').optional().isBoolean(),
+      body('settings.threatDetection').optional().isBoolean(),
+      body('settings.maxEventSize').optional().isInt({ min: 100, max: 10000 }),
+      body('settings.blockedPatterns').optional().isArray(),
+      body('userId').isString().isLength({ min: 1, max: 100 })
     ], this.updateCalendarSecuritySettings.bind(this));
+
+    // Add validation error handler
+    router.use(this.handleValidationErrors.bind(this));
+  }
+
+  // Handle validation errors
+  handleValidationErrors(req, res, next) {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Input validation failed',
+          details: errors.array().map(err => ({
+            field: err.path,
+            message: err.msg,
+            value: err.value
+          })),
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+    next();
+  }
+
+  // Sanitize input data
+  sanitizeInput(data) {
+    if (typeof data === 'string') {
+      return data
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/javascript:/gi, '')
+        .replace(/on\w+\s*=/gi, '')
+        .replace(/data:text\/html/gi, '')
+        .trim();
+    } else if (typeof data === 'object' && data !== null) {
+      const sanitized = {};
+      for (const [key, value] of Object.entries(data)) {
+        sanitized[key] = this.sanitizeInput(value);
+      }
+      return sanitized;
+    }
+    return data;
   }
 
   async processCalendarEvent(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const securityPatch = req.app.locals.securityPatch;
+      if (!securityPatch) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const securityPatch = req.app.locals.securityPatch;
-      if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
-      }
-
-      const { event, userId, sessionId } = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { event, userId, sessionId } = sanitizedBody;
       
       // Generate session ID if not provided
       const finalSessionId = sessionId || `cal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -82,7 +156,9 @@ class CalendarRoutes {
         result: {
           allowed: result.allowed,
           reason: result.reason
-        }
+        },
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({
@@ -90,30 +166,45 @@ class CalendarRoutes {
         result,
         sessionId: finalSessionId,
         eventId: event.id,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error processing calendar event:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error processing calendar event:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
   async validateCalendarEvent(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const securityPatch = req.app.locals.securityPatch;
+      if (!securityPatch) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const securityPatch = req.app.locals.securityPatch;
-      if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
-      }
-
-      const { event, userId } = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { event, userId } = sanitizedBody;
       
       // Extract event content for validation
       const eventContent = this.extractEventContent(event);
@@ -137,7 +228,9 @@ class CalendarRoutes {
           blocked: result.blocked,
           threats: result.threats.length,
           calendarSpecific: calendarValidation
-        }
+        },
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({
@@ -148,11 +241,26 @@ class CalendarRoutes {
           overallValid: !result.blocked && calendarValidation.valid
         },
         eventId: event.id,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error validating calendar event:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error validating calendar event:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 

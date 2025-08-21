@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, validationResult, param, query } = require('express-validator');
 const Logger = require('../utils/Logger');
 
 class SecurityRoutes {
@@ -16,68 +16,162 @@ class SecurityRoutes {
     // Get security statistics
     router.get('/stats', this.getSecurityStats.bind(this));
     
-    // Update security configuration
+    // Update security configuration with enhanced validation
     router.post('/config', [
       body('strictMode').optional().isBoolean(),
       body('maxContextSize').optional().isInt({ min: 1000, max: 100000 }),
       body('maxToolChaining').optional().isInt({ min: 1, max: 10 }),
       body('requireConfirmationFor').optional().isArray(),
-      body('blockedPatterns').optional().isArray()
+      body('requireConfirmationFor.*').optional().isString().isLength({ min: 1, max: 50 }),
+      body('blockedPatterns').optional().isArray(),
+      body('blockedPatterns.*').optional().isString().isLength({ min: 1, max: 200 }),
+      body('threatThresholds.low').optional().isFloat({ min: 0, max: 1 }),
+      body('threatThresholds.medium').optional().isFloat({ min: 0, max: 1 }),
+      body('threatThresholds.high').optional().isFloat({ min: 0, max: 1 }),
+      body('threatThresholds.critical').optional().isFloat({ min: 0, max: 1 })
     ], this.updateSecurityConfig.bind(this));
     
     // Get configuration
     router.get('/config', this.getConfiguration.bind(this));
     
-    // Update secrets
+    // Update secrets with enhanced validation
     router.post('/secrets', [
-      body('key').isString().notEmpty(),
-      body('value').isString().notEmpty()
+      body('key').isString().isLength({ min: 1, max: 100 }),
+      body('value').isString().isLength({ min: 1, max: 1000 })
     ], this.updateSecret.bind(this));
     
     // Get secrets summary
     router.get('/secrets', this.getSecretsSummary.bind(this));
     
-    // Get threat statistics
-    router.get('/threats', this.getThreatStats.bind(this));
+    // Get threat statistics with validation
+    router.get('/threats', [
+      query('timeRange').optional().isIn(['1h', '24h', '7d', '30d']),
+      query('type').optional().isIn(['all', 'prompt-injection', 'data-exfiltration', 'device-control', 'social-engineering']),
+      query('limit').optional().isInt({ min: 1, max: 1000 }),
+      query('offset').optional().isInt({ min: 0 })
+    ], this.getThreatStats.bind(this));
     
-    // Get access control statistics
-    router.get('/access', this.getAccessStats.bind(this));
+    // Get access control statistics with validation
+    router.get('/access', [
+      query('timeRange').optional().isIn(['1h', '24h', '7d', '30d']),
+      query('userId').optional().isString().isLength({ min: 1, max: 100 })
+    ], this.getAccessStats.bind(this));
     
-    // Get confirmation statistics
-    router.get('/confirmations', this.getConfirmationStats.bind(this));
+    // Get confirmation statistics with validation
+    router.get('/confirmations', [
+      query('timeRange').optional().isIn(['1h', '24h', '7d', '30d']),
+      query('status').optional().isIn(['pending', 'approved', 'denied', 'expired'])
+    ], this.getConfirmationStats.bind(this));
     
-    // Test security patch
+    // Test security patch with enhanced validation
     router.post('/test', [
-      body('input').isString().notEmpty(),
-      body('source').optional().isString(),
-      body('userId').optional().isString()
+      body('input').isString().isLength({ min: 1, max: 5000 }).escape(),
+      body('source').optional().isString().isLength({ min: 1, max: 50 }),
+      body('userId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('context').optional().isObject(),
+      body('expectedResult').optional().isObject()
     ], this.testSecurityPatch.bind(this));
     
-    // Get security logs
-    router.get('/logs', this.getSecurityLogs.bind(this));
+    // Get security logs with validation
+    router.get('/logs', [
+      query('lines').optional().isInt({ min: 1, max: 1000 }),
+      query('type').optional().isIn(['all', 'security', 'access', 'error', 'threat', 'audit']),
+      query('level').optional().isIn(['info', 'warn', 'error', 'security', 'threat']),
+      query('startDate').optional().isISO8601(),
+      query('endDate').optional().isISO8601()
+    ], this.getSecurityLogs.bind(this));
     
     // Clear security cache
     router.post('/clear-cache', this.clearSecurityCache.bind(this));
+
+    // Add validation error handler
+    router.use(this.handleValidationErrors.bind(this));
+  }
+
+  // Handle validation errors
+  handleValidationErrors(req, res, next) {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Input validation failed',
+          details: errors.array().map(err => ({
+            field: err.path,
+            message: err.msg,
+            value: err.value
+          })),
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+    next();
+  }
+
+  // Sanitize input data
+  sanitizeInput(data) {
+    if (typeof data === 'string') {
+      return data
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/javascript:/gi, '')
+        .replace(/on\w+\s*=/gi, '')
+        .replace(/data:text\/html/gi, '')
+        .trim();
+    } else if (typeof data === 'object' && data !== null) {
+      const sanitized = {};
+      for (const [key, value] of Object.entries(data)) {
+        sanitized[key] = this.sanitizeInput(value);
+      }
+      return sanitized;
+    }
+    return data;
   }
 
   async getSecurityStatus(req, res) {
     try {
       const securityPatch = req.app.locals.securityPatch;
       if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
+        });
       }
 
       const status = securityPatch.getSecurityStatus();
       
       this.logger.access('Security status requested', {
         ip: req.ip,
-        userAgent: req.get('User-Agent')
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
-      res.json(status);
+      res.json({
+        ...status,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
     } catch (error) {
-      this.logger.error('Error getting security status:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error getting security status:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
@@ -85,7 +179,13 @@ class SecurityRoutes {
     try {
       const securityPatch = req.app.locals.securityPatch;
       if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
+        });
       }
 
       const stats = {
@@ -99,34 +199,54 @@ class SecurityRoutes {
 
       this.logger.access('Security stats requested', {
         ip: req.ip,
-        userAgent: req.get('User-Agent')
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
-      res.json(stats);
+      res.json({
+        ...stats,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
     } catch (error) {
-      this.logger.error('Error getting security stats:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error getting security stats:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
   async updateSecurityConfig(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
-        });
-      }
-
       const securityPatch = req.app.locals.securityPatch;
       const configManager = req.app.locals.configManager;
       
       if (!securityPatch || !configManager) {
-        return res.status(503).json({ error: 'Security patch not available' });
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
+        });
       }
 
-      const newConfig = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const newConfig = sanitizedBody;
       
       // Update configuration in config manager
       for (const [key, value] of Object.entries(newConfig)) {
@@ -139,17 +259,35 @@ class SecurityRoutes {
       this.logger.audit('Security configuration updated', {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
-        config: newConfig
+        config: newConfig,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({ 
         success: true, 
         message: 'Security configuration updated successfully',
-        config: securityPatch.securityConfig
+        config: securityPatch.securityConfig,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error updating security config:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error updating security config:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
@@ -157,54 +295,98 @@ class SecurityRoutes {
     try {
       const configManager = req.app.locals.configManager;
       if (!configManager) {
-        return res.status(503).json({ error: 'Configuration manager not available' });
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Configuration manager not available',
+            timestamp: new Date().toISOString()
+          }
+        });
       }
 
       const config = configManager.getFullConfig();
       
       this.logger.access('Configuration requested', {
         ip: req.ip,
-        userAgent: req.get('User-Agent')
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
-      res.json(config);
+      res.json({
+        ...config,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
     } catch (error) {
-      this.logger.error('Error getting configuration:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error getting configuration:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
   async updateSecret(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const configManager = req.app.locals.configManager;
+      if (!configManager) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Configuration manager not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const configManager = req.app.locals.configManager;
-      if (!configManager) {
-        return res.status(503).json({ error: 'Configuration manager not available' });
-      }
-
-      const { key, value } = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { key, value } = sanitizedBody;
       await configManager.updateSecret(key, value);
 
       this.logger.audit('Secret updated', {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
-        key: key
+        key: key,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({ 
         success: true, 
-        message: 'Secret updated successfully'
+        message: 'Secret updated successfully',
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error updating secret:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error updating secret:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 

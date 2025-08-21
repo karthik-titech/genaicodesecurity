@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, validationResult, param, query } = require('express-validator');
 const Logger = require('../utils/Logger');
 
 class GoogleHomeRoutes {
@@ -10,64 +10,134 @@ class GoogleHomeRoutes {
   }
 
   setupRoutes() {
-    // Process Google Home input
+    // Process Google Home input with enhanced validation
     router.post('/process', [
-      body('input').isString().notEmpty(),
-      body('userId').isString().notEmpty(),
-      body('deviceId').optional().isString(),
-      body('sessionId').optional().isString()
+      body('input').isString().isLength({ min: 1, max: 1000 }).escape(),
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('deviceId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('sessionId').optional().isString().isLength({ min: 1, max: 100 })
     ], this.processGoogleHomeInput.bind(this));
     
-    // Execute Google Home command
+    // Execute Google Home command with enhanced validation
     router.post('/execute', [
-      body('command').isString().notEmpty(),
+      body('command').isString().isLength({ min: 1, max: 100 }).escape(),
       body('parameters').optional().isObject(),
-      body('userId').isString().notEmpty(),
-      body('confirmationId').optional().isString(),
-      body('deviceId').optional().isString()
+      body('parameters.deviceId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('parameters.action').optional().isString().isLength({ min: 1, max: 50 }),
+      body('parameters.value').optional().isString().isLength({ min: 1, max: 100 }),
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('confirmationId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('deviceId').optional().isString().isLength({ min: 1, max: 100 })
     ], this.executeGoogleHomeCommand.bind(this));
     
-    // Get device status
-    router.get('/devices/:deviceId/status', this.getDeviceStatus.bind(this));
+    // Get device status with validation
+    router.get('/devices/:deviceId/status', [
+      param('deviceId').isString().isLength({ min: 1, max: 100 }),
+      query('userId').optional().isString().isLength({ min: 1, max: 100 })
+    ], this.getDeviceStatus.bind(this));
     
-    // List available devices
-    router.get('/devices', this.listDevices.bind(this));
+    // List available devices with validation
+    router.get('/devices', [
+      query('userId').optional().isString().isLength({ min: 1, max: 100 }),
+      query('type').optional().isIn(['light', 'switch', 'camera', 'lock', 'thermostat', 'all']),
+      query('limit').optional().isInt({ min: 1, max: 100 }),
+      query('offset').optional().isInt({ min: 0 })
+    ], this.listDevices.bind(this));
     
-    // Get device permissions
-    router.get('/devices/:deviceId/permissions', this.getDevicePermissions.bind(this));
+    // Get device permissions with validation
+    router.get('/devices/:deviceId/permissions', [
+      param('deviceId').isString().isLength({ min: 1, max: 100 }),
+      query('userId').optional().isString().isLength({ min: 1, max: 100 })
+    ], this.getDevicePermissions.bind(this));
     
-    // Update device permissions
+    // Update device permissions with enhanced validation
     router.put('/devices/:deviceId/permissions', [
+      param('deviceId').isString().isLength({ min: 1, max: 100 }),
       body('permissions').isObject(),
-      body('userId').isString().notEmpty()
+      body('permissions.read').optional().isBoolean(),
+      body('permissions.write').optional().isBoolean(),
+      body('permissions.execute').optional().isBoolean(),
+      body('permissions.admin').optional().isBoolean(),
+      body('userId').isString().isLength({ min: 1, max: 100 })
     ], this.updateDevicePermissions.bind(this));
     
-    // Get Google Home logs
-    router.get('/logs', this.getGoogleHomeLogs.bind(this));
+    // Get Google Home logs with validation
+    router.get('/logs', [
+      query('lines').optional().isInt({ min: 1, max: 1000 }),
+      query('type').optional().isIn(['all', 'security', 'access', 'error', 'device']),
+      query('deviceId').optional().isString().isLength({ min: 1, max: 100 }),
+      query('startDate').optional().isISO8601(),
+      query('endDate').optional().isISO8601()
+    ], this.getGoogleHomeLogs.bind(this));
     
-    // Test Google Home integration
+    // Test Google Home integration with enhanced validation
     router.post('/test', [
-      body('input').isString().notEmpty(),
-      body('userId').isString().notEmpty()
+      body('input').isString().isLength({ min: 1, max: 1000 }).escape(),
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('deviceId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('expectedResult').optional().isObject()
     ], this.testGoogleHomeIntegration.bind(this));
+
+    // Add validation error handler
+    router.use(this.handleValidationErrors.bind(this));
+  }
+
+  // Handle validation errors
+  handleValidationErrors(req, res, next) {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Input validation failed',
+          details: errors.array().map(err => ({
+            field: err.path,
+            message: err.msg,
+            value: err.value
+          })),
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+    next();
+  }
+
+  // Sanitize input data
+  sanitizeInput(data) {
+    if (typeof data === 'string') {
+      return data
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/javascript:/gi, '')
+        .replace(/on\w+\s*=/gi, '')
+        .replace(/data:text\/html/gi, '')
+        .trim();
+    } else if (typeof data === 'object' && data !== null) {
+      const sanitized = {};
+      for (const [key, value] of Object.entries(data)) {
+        sanitized[key] = this.sanitizeInput(value);
+      }
+      return sanitized;
+    }
+    return data;
   }
 
   async processGoogleHomeInput(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const securityPatch = req.app.locals.securityPatch;
+      if (!securityPatch) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const securityPatch = req.app.locals.securityPatch;
-      if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
-      }
-
-      const { input, userId, deviceId, sessionId } = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { input, userId, deviceId, sessionId } = sanitizedBody;
       
       // Generate session ID if not provided
       const finalSessionId = sessionId || `gh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -91,37 +161,54 @@ class GoogleHomeRoutes {
           blocked: result.blocked,
           threats: result.threats.length,
           requiresConfirmation: result.requiresConfirmation
-        }
+        },
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({
         success: true,
         result,
         sessionId: finalSessionId,
-        deviceId
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error processing Google Home input:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error processing Google Home input:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
   async executeGoogleHomeCommand(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const securityPatch = req.app.locals.securityPatch;
+      if (!securityPatch) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const securityPatch = req.app.locals.securityPatch;
-      if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
-      }
-
-      const { command, parameters = {}, userId, confirmationId, deviceId } = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { command, parameters = {}, userId, confirmationId, deviceId } = sanitizedBody;
       
       // Create security context for tool execution
       const securityContext = {
@@ -145,7 +232,9 @@ class GoogleHomeRoutes {
         result: {
           success: result.success,
           reason: result.reason
-        }
+        },
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({
@@ -153,11 +242,26 @@ class GoogleHomeRoutes {
         result,
         command,
         deviceId,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error executing Google Home command:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error executing Google Home command:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
@@ -209,8 +313,22 @@ class GoogleHomeRoutes {
 
       res.json(deviceStatus);
     } catch (error) {
-      this.logger.error('Error getting device status:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error getting device status:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
@@ -275,8 +393,22 @@ class GoogleHomeRoutes {
 
       res.json({ devices });
     } catch (error) {
-      this.logger.error('Error listing devices:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error listing devices:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
@@ -307,31 +439,45 @@ class GoogleHomeRoutes {
         deviceId,
         userId,
         permissions,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error getting device permissions:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error getting device permissions:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
   async updateDevicePermissions(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const securityPatch = req.app.locals.securityPatch;
+      if (!securityPatch) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const { deviceId } = req.params;
-      const { permissions, userId } = req.body;
-
-      const securityPatch = req.app.locals.securityPatch;
-      if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
-      }
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { deviceId, permissions, userId } = sanitizedBody;
 
       // Update permissions for each resource type
       const results = [];
@@ -354,7 +500,9 @@ class GoogleHomeRoutes {
         userId,
         deviceId,
         permissions,
-        results
+        results,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({
@@ -362,11 +510,26 @@ class GoogleHomeRoutes {
         deviceId,
         userId,
         results,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error updating device permissions:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error updating device permissions:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
@@ -401,27 +564,41 @@ class GoogleHomeRoutes {
         filtered: true
       });
     } catch (error) {
-      this.logger.error('Error getting Google Home logs:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error getting Google Home logs:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
   async testGoogleHomeIntegration(req, res) {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ 
-          error: 'Validation failed', 
-          details: errors.array() 
+      const securityPatch = req.app.locals.securityPatch;
+      if (!securityPatch) {
+        return res.status(503).json({ 
+          error: {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Security patch not available',
+            timestamp: new Date().toISOString()
+          }
         });
       }
 
-      const securityPatch = req.app.locals.securityPatch;
-      if (!securityPatch) {
-        return res.status(503).json({ error: 'Security patch not available' });
-      }
-
-      const { input, userId } = req.body;
+      // Sanitize input
+      const sanitizedBody = this.sanitizeInput(req.body);
+      const { input, userId } = sanitizedBody;
       
       // Test various Google Home scenarios
       const testScenarios = [
@@ -475,7 +652,9 @@ class GoogleHomeRoutes {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
         userId,
-        results
+        results,
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
 
       res.json({
@@ -485,11 +664,27 @@ class GoogleHomeRoutes {
           total: results.length,
           passed: results.filter(r => r.passed).length,
           failed: results.filter(r => !r.passed).length
-        }
+        },
+        timestamp: new Date().toISOString(),
+        requestId: req.id
       });
     } catch (error) {
-      this.logger.error('Error testing Google Home integration:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      this.logger.error('Error testing Google Home integration:', {
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        requestId: req.id
+      });
+      res.status(500).json({ 
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'Internal server error',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
     }
   }
 
