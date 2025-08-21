@@ -1,26 +1,316 @@
 const express = require('express');
-const { body, validationResult } = require('express-validator');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { body, validationResult, param, query } = require('express-validator');
 const Logger = require('../utils/Logger');
 
 class APIRouter {
   constructor() {
     this.router = express.Router();
     this.logger = new Logger();
+    this.setupMiddleware();
     this.setupRoutes();
   }
 
+  setupMiddleware() {
+    // Add request ID and timing
+    this.router.use(this.logRequest.bind(this));
+    
+    // Authentication for all routes except health and version
+    this.router.use(['/health', '/version'], (req, res, next) => next());
+    this.router.use(this.authenticateAPI.bind(this));
+    this.router.use(this.rateLimit.bind(this));
+    
+    // Input validation middleware
+    this.router.use(this.validateInput.bind(this));
+  }
+
+  // Enhanced input validation middleware
+  validateInput(req, res, next) {
+    // Sanitize and validate request body
+    if (req.body) {
+      req.body = this.sanitizeInput(req.body);
+    }
+    
+    // Sanitize and validate query parameters
+    if (req.query) {
+      req.query = this.sanitizeInput(req.query);
+    }
+    
+    // Sanitize and validate URL parameters
+    if (req.params) {
+      req.params = this.sanitizeInput(req.params);
+    }
+    
+    next();
+  }
+
+  // Input sanitization
+  sanitizeInput(obj) {
+    if (typeof obj !== 'object' || obj === null) {
+      return obj;
+    }
+    
+    const sanitized = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (typeof value === 'string') {
+        // Remove potential XSS and injection patterns
+        sanitized[key] = value
+          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+          .replace(/javascript:/gi, '')
+          .replace(/on\w+\s*=/gi, '')
+          .replace(/data:text\/html/gi, '')
+          .trim();
+      } else if (typeof value === 'object') {
+        sanitized[key] = this.sanitizeInput(value);
+      } else {
+        sanitized[key] = value;
+      }
+    }
+    
+    return sanitized;
+  }
+
+  // Enhanced authentication middleware
+  async authenticateAPI(req, res, next) {
+    const apiKey = req.headers.authorization?.replace('Bearer ', '') || 
+                   req.headers['x-api-key'];
+    
+    if (!apiKey) {
+      return res.status(401).json({
+        error: {
+          code: 'MISSING_API_KEY',
+          message: 'API key is required',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+
+    // Validate API key format and length
+    if (!this.isValidAPIKeyFormat(apiKey)) {
+      return res.status(401).json({
+        error: {
+          code: 'INVALID_API_KEY_FORMAT',
+          message: 'Invalid API key format',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+
+    // Get config manager for API key validation
+    const configManager = req.app.locals.configManager;
+    if (!configManager) {
+      return res.status(503).json({
+        error: {
+          code: 'SERVICE_UNAVAILABLE',
+          message: 'Configuration manager not available',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+
+    // Validate API key against stored keys
+    if (!(await this.validateAPIKey(apiKey, configManager))) {
+      this.logger.security('Invalid API key attempt', {
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        apiKey: this.maskAPIKey(apiKey)
+      });
+      
+      return res.status(401).json({
+        error: {
+          code: 'INVALID_API_KEY',
+          message: 'Invalid API key provided',
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+
+    req.apiKey = apiKey;
+    req.apiKeyHash = this.hashAPIKey(apiKey);
+    next();
+  }
+
+  // Validate API key format
+  isValidAPIKeyFormat(apiKey) {
+    // API key should be at least 32 characters and contain alphanumeric characters
+    const apiKeyRegex = /^[a-zA-Z0-9]{32,}$/;
+    return apiKeyRegex.test(apiKey);
+  }
+
+  // Validate API key against stored keys
+  async validateAPIKey(apiKey, configManager) {
+    try {
+      // Use the enhanced API key validation from ConfigManager
+      const validationResult = await configManager.validateAPIKey(apiKey);
+      return validationResult.valid;
+    } catch (error) {
+      this.logger.error('Error validating API key:', error);
+      return false;
+    }
+  }
+
+  // Hash API key for secure comparison
+  hashAPIKey(apiKey) {
+    return crypto.createHash('sha256').update(apiKey).digest('hex');
+  }
+
+  // Mask API key for logging
+  maskAPIKey(apiKey) {
+    if (!apiKey || apiKey.length < 8) return '***';
+    return `${apiKey.substring(0, 4)}***${apiKey.substring(apiKey.length - 4)}`;
+  }
+
   setupRoutes() {
-    // API versioning middleware
-    this.router.use('/v1', this.setupV1Routes());
-    
-    // API health check
+    // Health and version endpoints (no auth required)
     this.router.get('/health', this.healthCheck.bind(this));
-    
-    // API documentation
-    this.router.get('/docs', this.getAPIDocs.bind(this));
-    
-    // API version info
     this.router.get('/version', this.getVersion.bind(this));
+    
+    // Security routes with validation
+    this.router.get('/security/status', this.getSecurityStatus.bind(this));
+    this.router.get('/security/stats', this.getSecurityStats.bind(this));
+    this.router.post('/security/config', [
+      body('strictMode').optional().isBoolean(),
+      body('maxContextSize').optional().isInt({ min: 100, max: 10000 }),
+      body('maxToolChaining').optional().isInt({ min: 1, max: 5 }),
+      body('threatThresholds.low').optional().isFloat({ min: 0, max: 1 }),
+      body('threatThresholds.medium').optional().isFloat({ min: 0, max: 1 }),
+      body('threatThresholds.high').optional().isFloat({ min: 0, max: 1 }),
+      body('threatThresholds.critical').optional().isFloat({ min: 0, max: 1 })
+    ], this.updateSecurityConfig.bind(this));
+    
+    // Google Home routes with validation
+    this.router.post('/google-home/process', [
+      body('input').isString().isLength({ min: 1, max: 1000 }).escape(),
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('sessionId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('context').optional().isObject(),
+      body('context.deviceId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('context.location').optional().isString().isLength({ min: 1, max: 100 })
+    ], this.processGoogleHomeInput.bind(this));
+    
+    this.router.post('/google-home/execute', [
+      body('command').isString().isLength({ min: 1, max: 100 }).escape(),
+      body('parameters').optional().isObject(),
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('confirmationId').optional().isString().isLength({ min: 1, max: 100 }),
+      body('deviceId').optional().isString().isLength({ min: 1, max: 100 })
+    ], this.executeGoogleHomeCommand.bind(this));
+    
+    this.router.get('/google-home/devices', this.getGoogleHomeDevices.bind(this));
+    this.router.get('/google-home/devices/:deviceId', [
+      param('deviceId').isString().isLength({ min: 1, max: 100 })
+    ], this.getGoogleHomeDevice.bind(this));
+    
+    // Calendar routes with validation
+    this.router.post('/calendar/process-event', [
+      body('event').isObject(),
+      body('event.summary').isString().isLength({ min: 1, max: 500 }).escape(),
+      body('event.description').optional().isString().isLength({ max: 2000 }).escape(),
+      body('event.start').isISO8601(),
+      body('event.end').isISO8601(),
+      body('userId').isString().isLength({ min: 1, max: 100 })
+    ], this.processCalendarEvent.bind(this));
+    
+    this.router.post('/calendar/validate', [
+      body('event').isObject(),
+      body('userId').isString().isLength({ min: 1, max: 100 })
+    ], this.validateCalendarEvent.bind(this));
+    
+    this.router.get('/calendar/security-status', this.getCalendarSecurityStatus.bind(this));
+    
+    // Threat detection routes with validation
+    this.router.post('/threats/analyze', [
+      body('input').isString().isLength({ min: 1, max: 5000 }).escape(),
+      body('context').optional().isObject(),
+      body('userId').optional().isString().isLength({ min: 1, max: 100 })
+    ], this.analyzeThreats.bind(this));
+    
+    this.router.get('/threats/stats', [
+      query('timeRange').optional().isIn(['1h', '24h', '7d', '30d'])
+    ], this.getThreatStats.bind(this));
+    
+    this.router.get('/threats/history', [
+      query('limit').optional().isInt({ min: 1, max: 1000 }),
+      query('offset').optional().isInt({ min: 0 })
+    ], this.getThreatHistory.bind(this));
+    
+    // User management routes with validation
+    this.router.post('/users/sessions', [
+      body('userId').isString().isLength({ min: 1, max: 100 }),
+      body('permissions').optional().isArray(),
+      body('sessionDuration').optional().isInt({ min: 300, max: 86400 }) // 5 min to 24 hours
+    ], this.createUserSession.bind(this));
+    
+    this.router.get('/users/:userId/permissions', [
+      param('userId').isString().isLength({ min: 1, max: 100 })
+    ], this.getUserPermissions.bind(this));
+    
+    this.router.put('/users/:userId/permissions', [
+      param('userId').isString().isLength({ min: 1, max: 100 }),
+      body('permissions').isArray()
+    ], this.updateUserPermissions.bind(this));
+    
+    this.router.delete('/users/sessions/:sessionId', [
+      param('sessionId').isString().isLength({ min: 1, max: 100 })
+    ], this.invalidateSession.bind(this));
+    
+    // Configuration routes with validation
+    this.router.get('/config', this.getConfiguration.bind(this));
+    this.router.put('/config', [
+      body('security').optional().isObject(),
+      body('api').optional().isObject(),
+      body('features').optional().isObject()
+    ], this.updateConfiguration.bind(this));
+    
+    // Webhook routes with validation
+    this.router.post('/webhooks', [
+      body('url').isURL().isLength({ min: 10, max: 500 }),
+      body('events').isArray(),
+      body('secret').optional().isString().isLength({ min: 16, max: 100 })
+    ], this.configureWebhook.bind(this));
+    
+    this.router.get('/webhooks', this.listWebhooks.bind(this));
+    this.router.delete('/webhooks/:webhookId', [
+      param('webhookId').isString().isLength({ min: 1, max: 100 })
+    ], this.deleteWebhook.bind(this));
+    
+    // Testing routes with validation
+    this.router.post('/test/security', [
+      body('scenarios').isArray(),
+      body('scenarios.*.type').isIn(['prompt-injection', 'data-exfiltration', 'device-control', 'social-engineering']),
+      body('scenarios.*.input').isString().isLength({ min: 1, max: 2000 }).escape()
+    ], this.testSecurityScenarios.bind(this));
+    
+    this.router.get('/test/connectivity', this.testConnectivity.bind(this));
+    
+    // Add validation error handler
+    this.router.use(this.handleValidationErrors.bind(this));
+  }
+
+  // Handle validation errors
+  handleValidationErrors(req, res, next) {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Input validation failed',
+          details: errors.array().map(err => ({
+            field: err.path,
+            message: err.msg,
+            value: err.value
+          })),
+          timestamp: new Date().toISOString(),
+          requestId: req.id
+        }
+      });
+    }
+    next();
   }
 
   setupV1Routes() {
@@ -146,52 +436,6 @@ class APIRouter {
     return testRouter;
   }
 
-  // Authentication middleware
-  authenticateAPI(req, res, next) {
-    const apiKey = req.headers.authorization?.replace('Bearer ', '') || 
-                   req.headers['x-api-key'];
-    
-    if (!apiKey) {
-      return res.status(401).json({
-        error: {
-          code: 'INVALID_API_KEY',
-          message: 'API key is required',
-          timestamp: new Date().toISOString(),
-          requestId: req.id
-        }
-      });
-    }
-
-    // Validate API key (implement your validation logic)
-    const configManager = req.app.locals.configManager;
-    if (!configManager) {
-      return res.status(503).json({
-        error: {
-          code: 'SERVICE_UNAVAILABLE',
-          message: 'Configuration manager not available',
-          timestamp: new Date().toISOString(),
-          requestId: req.id
-        }
-      });
-    }
-
-    // For now, accept any non-empty API key
-    // In production, validate against stored API keys
-    if (!apiKey || apiKey.length < 10) {
-      return res.status(401).json({
-        error: {
-          code: 'INVALID_API_KEY',
-          message: 'Invalid API key provided',
-          timestamp: new Date().toISOString(),
-          requestId: req.id
-        }
-      });
-    }
-
-    req.apiKey = apiKey;
-    next();
-  }
-
   // Rate limiting middleware
   rateLimit(req, res, next) {
     // Simple in-memory rate limiting
@@ -206,7 +450,7 @@ class APIRouter {
     }
 
     const store = req.app.locals.rateLimitStore;
-    const key = `${clientIP}:${req.apiKey}`;
+    const key = `${clientIP}:${req.apiKeyHash}`; // Use hashed API key for rate limiting
     const record = store.get(key) || { count: 0, resetTime: now + windowMs };
 
     if (now > record.resetTime) {
@@ -252,7 +496,7 @@ class APIRouter {
       path: req.path,
       ip: req.ip,
       userAgent: req.get('User-Agent'),
-      apiKey: req.apiKey ? `${req.apiKey.substring(0, 8)}...` : 'none'
+      apiKey: req.apiKey ? this.maskAPIKey(req.apiKey) : 'none'
     });
 
     // Log response
@@ -889,11 +1133,46 @@ class APIRouter {
   }
 
   generateJWT(payload) {
-    // In production, use a proper JWT library
-    const header = { alg: 'HS256', typ: 'JWT' };
-    const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64');
-    const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
-    return `${encodedHeader}.${encodedPayload}.signature`;
+    try {
+      const configManager = this.router.app?.locals?.configManager;
+      const jwtSecret = configManager?.getSecret('jwt.secret') || process.env.JWT_SECRET;
+      
+      if (!jwtSecret) {
+        throw new Error('JWT secret not configured');
+      }
+      
+      // Use proper JWT library with secure options
+      return jwt.sign(payload, jwtSecret, {
+        algorithm: 'HS256',
+        expiresIn: payload.expiresIn || '1h',
+        issuer: 'google-home-security-patch',
+        audience: 'api-users'
+      });
+    } catch (error) {
+      this.logger.error('Error generating JWT:', error);
+      throw new Error('Failed to generate authentication token');
+    }
+  }
+
+  verifyJWT(token) {
+    try {
+      const configManager = this.router.app?.locals?.configManager;
+      const jwtSecret = configManager?.getSecret('jwt.secret') || process.env.JWT_SECRET;
+      
+      if (!jwtSecret) {
+        throw new Error('JWT secret not configured');
+      }
+      
+      // Verify JWT with proper options
+      return jwt.verify(token, jwtSecret, {
+        algorithms: ['HS256'],
+        issuer: 'google-home-security-patch',
+        audience: 'api-users'
+      });
+    } catch (error) {
+      this.logger.error('Error verifying JWT:', error);
+      throw new Error('Invalid authentication token');
+    }
   }
 
   calculateRiskLevel(score) {

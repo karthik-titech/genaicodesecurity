@@ -131,11 +131,21 @@ class ConfigManager {
     const initialSecrets = {
       googleHome: {
         apiKey: process.env.GOOGLE_HOME_API_KEY || '',
-        projectId: process.env.GOOGLE_HOME_PROJECT_ID || ''
+        webhookSecret: process.env.GOOGLE_HOME_WEBHOOK_SECRET || this.generateSecureSecret(32)
       },
       calendar: {
         apiKey: process.env.GOOGLE_CALENDAR_API_KEY || '',
-        webhookSecret: process.env.CALENDAR_WEBHOOK_SECRET || ''
+        webhookSecret: process.env.CALENDAR_WEBHOOK_SECRET || this.generateSecureSecret(32)
+      },
+      jwt: {
+        secret: process.env.JWT_SECRET || this.generateSecureSecret(64),
+        refreshSecret: process.env.JWT_REFRESH_SECRET || this.generateSecureSecret(64)
+      },
+      apiKeys: {
+        // Generate default API keys for different tiers
+        free: process.env.FREE_TIER_API_KEY || this.generateSecureSecret(32),
+        pro: process.env.PRO_TIER_API_KEY || this.generateSecureSecret(32),
+        enterprise: process.env.ENTERPRISE_API_KEY || this.generateSecureSecret(32)
       },
       encryption: {
         masterKey: this.generateMasterKey()
@@ -144,8 +154,102 @@ class ConfigManager {
 
     await this.saveEncryptedSecrets(initialSecrets);
     this.encryptedKeys = initialSecrets;
-    
     this.logger.info('Created initial encrypted secrets file');
+  }
+
+  generateSecureSecret(length = 32) {
+    return crypto.randomBytes(length).toString('hex');
+  }
+
+  // Enhanced API key management
+  async generateAPIKey(tier = 'free', userId = null) {
+    const apiKey = this.generateSecureSecret(32);
+    const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+    
+    const keyData = {
+      key: apiKeyHash,
+      tier,
+      userId,
+      createdAt: new Date().toISOString(),
+      lastUsed: null,
+      isActive: true
+    };
+
+    // Store API key hash in encrypted secrets
+    if (!this.encryptedKeys.apiKeyHashes) {
+      this.encryptedKeys.apiKeyHashes = {};
+    }
+    
+    this.encryptedKeys.apiKeyHashes[apiKeyHash] = keyData;
+    await this.saveEncryptedSecrets(this.encryptedKeys);
+    
+    this.logger.info(`Generated new API key for tier: ${tier}, userId: ${userId}`);
+    
+    // Return the plain API key (only time it's exposed)
+    return {
+      apiKey,
+      tier,
+      userId,
+      createdAt: keyData.createdAt
+    };
+  }
+
+  async validateAPIKey(apiKey) {
+    if (!apiKey || typeof apiKey !== 'string') {
+      return { valid: false, reason: 'Invalid API key format' };
+    }
+
+    const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+    const keyData = this.encryptedKeys.apiKeyHashes?.[apiKeyHash];
+    
+    if (!keyData) {
+      return { valid: false, reason: 'API key not found' };
+    }
+
+    if (!keyData.isActive) {
+      return { valid: false, reason: 'API key is inactive' };
+    }
+
+    // Update last used timestamp
+    keyData.lastUsed = new Date().toISOString();
+    this.encryptedKeys.apiKeyHashes[apiKeyHash] = keyData;
+    await this.saveEncryptedSecrets(this.encryptedKeys);
+
+    return {
+      valid: true,
+      tier: keyData.tier,
+      userId: keyData.userId,
+      createdAt: keyData.createdAt
+    };
+  }
+
+  async revokeAPIKey(apiKeyHash) {
+    if (this.encryptedKeys.apiKeyHashes?.[apiKeyHash]) {
+      this.encryptedKeys.apiKeyHashes[apiKeyHash].isActive = false;
+      this.encryptedKeys.apiKeyHashes[apiKeyHash].revokedAt = new Date().toISOString();
+      await this.saveEncryptedSecrets(this.encryptedKeys);
+      this.logger.info(`Revoked API key: ${apiKeyHash.substring(0, 8)}...`);
+      return true;
+    }
+    return false;
+  }
+
+  async listAPIKeys() {
+    const keys = [];
+    if (this.encryptedKeys.apiKeyHashes) {
+      for (const [hash, data] of Object.entries(this.encryptedKeys.apiKeyHashes)) {
+        keys.push({
+          hash: hash.substring(0, 8) + '...',
+          tier: data.tier,
+          userId: data.userId,
+          createdAt: data.createdAt,
+          lastUsed: data.lastUsed,
+          isActive: data.isActive,
+          revokedAt: data.revokedAt
+        });
+      }
+    }
+    return keys;
   }
 
   async saveEncryptedSecrets(secrets) {
