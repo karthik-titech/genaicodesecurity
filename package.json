@@ -11,6 +11,7 @@
     "test-security": "node test-security-patch.js",
     "security-audit": "node test-security-audit.js",
     "test-api": "node test-api.js",
+    "test-key-workflow": "node test-key-workflow-rotation.js",
     "lint": "eslint src/",
     "security-scan": "npm audit && snyk test",
     "security-audit": "npm audit --audit-level=moderate",

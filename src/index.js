@@ -7,6 +7,8 @@ require('dotenv').config();
 const SecurityPatch = require('./security/SecurityPatch');
 const ConfigManager = require('./config/ConfigManager');
 const SecurityMiddleware = require('./middleware/SecurityMiddleware');
+const KeyManagementSystem = require('./security/KeyManagementSystem');
+const WorkflowHandleRotation = require('./security/WorkflowHandleRotation');
 const Logger = require('./utils/Logger');
 
 class GoogleHomeSecurityPatch {
@@ -15,6 +17,8 @@ class GoogleHomeSecurityPatch {
     this.configManager = new ConfigManager();
     this.securityPatch = new SecurityPatch();
     this.securityMiddleware = new SecurityMiddleware();
+    this.keyManagementSystem = new KeyManagementSystem();
+    this.workflowHandleRotation = new WorkflowHandleRotation();
     this.logger = new Logger();
     
     this.initializeSecurityLayers();
@@ -31,7 +35,15 @@ class GoogleHomeSecurityPatch {
       // Initialize security patch with configuration
       await this.securityPatch.initialize(this.configManager);
       
+      // Initialize key management system
+      await this.keyManagementSystem.initialize();
+      
+      // Initialize workflow handle rotation system
+      await this.workflowHandleRotation.initialize();
+      
       this.logger.info('Security layers initialized successfully');
+      this.logger.info('Key Management System: ACTIVE');
+      this.logger.info('Workflow Handle Rotation: ACTIVE');
     } catch (error) {
       this.logger.error('Failed to initialize security layers:', error);
       throw error;
@@ -149,6 +161,9 @@ class GoogleHomeSecurityPatch {
     this.app.use('/api/google-home', require('./routes/googleHome'));
     this.app.use('/api/calendar', require('./routes/calendar'));
     
+    // Key Management and Workflow Handle Rotation routes
+    this.app.use('/api/key-management', require('./routes/keyManagement'));
+    
     // Error handling middleware with security logging
     this.app.use((err, req, res, next) => {
       this.logger.error('Unhandled error:', {
@@ -188,6 +203,8 @@ class GoogleHomeSecurityPatch {
     this.app.locals.securityPatch = this.securityPatch;
     this.app.locals.configManager = this.configManager;
     this.app.locals.securityMiddleware = this.securityMiddleware;
+    this.app.locals.keyManagementSystem = this.keyManagementSystem;
+    this.app.locals.workflowHandleRotation = this.workflowHandleRotation;
   }
 
   async start(port = process.env.PORT || 3000) {
@@ -209,11 +226,14 @@ class GoogleHomeSecurityPatch {
         this.logger.info('SQL injection protection: ENABLED');
         this.logger.info('XSS protection: ENABLED');
         this.logger.info('Advanced rate limiting: ENABLED');
+        this.logger.info('Key Management System: ENABLED');
+        this.logger.info('Workflow Handle Rotation: ENABLED');
       });
 
       // Graceful shutdown
       process.on('SIGTERM', () => {
         this.logger.info('SIGTERM received, shutting down gracefully');
+        this.shutdown();
         server.close(() => {
           this.logger.info('Process terminated');
           process.exit(0);
@@ -222,6 +242,7 @@ class GoogleHomeSecurityPatch {
 
       process.on('SIGINT', () => {
         this.logger.info('SIGINT received, shutting down gracefully');
+        this.shutdown();
         server.close(() => {
           this.logger.info('Process terminated');
           process.exit(0);
@@ -231,6 +252,26 @@ class GoogleHomeSecurityPatch {
     } catch (error) {
       this.logger.error('Failed to start security patch:', error);
       process.exit(1);
+    }
+  }
+
+  async shutdown() {
+    try {
+      this.logger.info('Shutting down security systems...');
+      
+      // Shutdown key management system
+      if (this.keyManagementSystem) {
+        await this.keyManagementSystem.shutdown();
+      }
+      
+      // Shutdown workflow handle rotation system
+      if (this.workflowHandleRotation) {
+        await this.workflowHandleRotation.shutdown();
+      }
+      
+      this.logger.info('Security systems shut down successfully');
+    } catch (error) {
+      this.logger.error('Error during shutdown:', error);
     }
   }
 }
